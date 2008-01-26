@@ -121,11 +121,21 @@ def DB(filename, types):
         for type in conf.supybot.databases():
             # Can't do this because Python sucks.  Go ahead, try it!
             # filename = '.'.join([filename, type, 'db'])
-            fn = '.'.join([filename, type, 'db'])
-            try:
-                return types[type](fn, *args, **kwargs)
-            except KeyError:
-                continue
+            if type == 'sqlalchemy':
+                sa = conf.supybot.databases.sqlalchemy
+                engine = sa.engine()
+                s = sa.engine.connection()
+                fn = '.'.join([filename, type, engine, 'db'])
+                try:
+                    return types[type](fn, s, *args, **kwargs)
+                except KeyError:
+                    continue
+            else:
+                fn = '.'.join([filename, type, 'db'])
+                try:
+                    return types[type](fn, *args, **kwargs)
+                except KeyError:
+                    continue
         raise NoSuitableDatabase, types.keys()
     return MakeDB
 
