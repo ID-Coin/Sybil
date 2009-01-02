@@ -29,6 +29,7 @@
 ###
 
 import os
+import imp
 import sys
 import time
 import socket
@@ -763,14 +764,20 @@ class Databases(registry.SpaceSeparatedListOfStrings):
         v = super(Databases, self).__call__()
         if not v:
             v = ['anydbm', 'cdb', 'flat', 'pickle']
-            if 'sqlite' in sys.modules:
-                v.insert(0, 'sqlite')
-            if 'sqlite3' in sys.modules:
+            try:
+                imp.find_module('sqlite3')
                 v.insert(0, 'sqlite3')
-            if 'pysqlite2' in sys.modules: # for python 2.4
-                v.insert(0, 'sqlite3')
-            if 'sqlalchemy' in sys.modules:
+            except ImportError:
+                try:
+                    imp.find_module('pysqlite2')
+                    v.insert(0, 'sqlite3')
+                except ImportError:
+                    pass
+            try:
+                imp.find_module('sqlalchemy')
                 v.insert(0, 'sqlalchemy')
+            except ImportError:
+                pass
         return v
 
     def serialize(self):
