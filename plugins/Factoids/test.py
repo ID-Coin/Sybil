@@ -29,6 +29,8 @@
 ###
 
 from supybot.test import *
+import supybot.ircmsgs as ircmsgs
+import supybot.callbacks as callbacks
 
 try:
     import sqlite3
@@ -75,6 +77,38 @@ class FactoidsTestCase(ChannelPluginTestCase):
 
         self.assertError('learn foo bar baz') # No 'as'
         self.assertError('learn foo bar') # No 'as'
+
+    def testNullBytesHandling(self):
+        """test some stuff with null bytes
+        
+        we have to be clever here, since this doesn't behave the same as a real
+        irc message. 
+        
+        a real irc message passes in a backslash, and a zero, which later 
+        gets interpreted somewhere along the line as a \x00 char.
+        
+        here, our \0 gets interpreted as \x00 right away, and runs afoul of
+        the ircutils.isValidArgument(), which doesn't allow \x00.
+        
+        as a result, we cannot just do something like this, even though it
+        does work is a 'real irc' scenario:
+            self.assertNotError("learn foo\0bar as moo\0zoob")
+            self.assertRegexp('whatis foo\0bar', 'moo\0zoob')
+        
+        so instead, we construct the callback arguments manually and directly
+        invoke the callbacks.
+        """
+        cb = self.irc.getCallback('Factoids')
+        msg = ircmsgs.privmsg(self.channel, '@learn foo as baz', 
+                prefix=self.prefix) # just any dummy msg
+        ircobj = callbacks.ReplyIrcProxy(self.irc, msg)
+        cb.learn(ircobj, msg, [self.channel, 'f\0oo','as','baz'])
+        m = self.getMsg(' ') # flush response from previous call
+        cb.whatis(ircobj, msg, [self.channel, 'f\0oo'])
+        m = self.getMsg(' ')
+        # the below works, if we have successfully stored the null-byte
+        # containing string in the db.
+        self.failUnless('baz' in str(m))
 
     def testChangeFactoid(self):
         self.assertNotError('learn foo as bar')

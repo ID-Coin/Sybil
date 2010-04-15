@@ -77,6 +77,13 @@ def getFactoidId(irc, msg, args, state):
 addConverter('factoid', getFactoid)
 addConverter('factoidId', getFactoidId)
 
+def adapt_binarytext(s):
+    return sqlite3.Binary(s)
+def convert_binarytext(s):
+    return str(s)
+sqlite3.register_adapter(str, adapt_binarytext)
+sqlite3.register_converter("BINARYTEXT", convert_binarytext)
+
 class Factoids(callbacks.Plugin, plugins.ChannelDBHandler):
     def __init__(self, irc):
         callbacks.Plugin.__init__(self, irc)
@@ -84,22 +91,22 @@ class Factoids(callbacks.Plugin, plugins.ChannelDBHandler):
 
     def makeDb(self, filename):
         if os.path.exists(filename):
-            db = sqlite3.connect(filename)
+            db = sqlite3.connect(filename, detect_types=sqlite3.PARSE_DECLTYPES)
             db.text_factory = str
             return db
-        db = sqlite3.connect(filename)
+        db = sqlite3.connect(filename, detect_types=sqlite3.PARSE_DECLTYPES)
         db.text_factory = str
         cursor = db.cursor()
         cursor.execute("""CREATE TABLE keys (
                           id INTEGER PRIMARY KEY,
-                          key TEXT UNIQUE ON CONFLICT REPLACE
+                          key BINARYTEXT UNIQUE ON CONFLICT REPLACE
                           )""")
         cursor.execute("""CREATE TABLE factoids (
                           id INTEGER PRIMARY KEY,
                           added_by TEXT,
-                          added_at TIMESTAMP,
-                          fact TEXT UNIQUE ON CONFLICT REPLACE,
-                          locked BOOLEAN
+                          added_at INTEGER,
+                          fact BINARYTEXT UNIQUE ON CONFLICT REPLACE,
+                          locked NUMERIC
                           )""")
         cursor.execute("""CREATE TABLE relations (
                           id INTEGER PRIMARY KEY,
@@ -641,7 +648,7 @@ class Factoids(callbacks.Plugin, plugins.ChannelDBHandler):
             irc.reply('More than 100 keys matched that query; '
                       'please narrow your query.')
         else:
-            keys = [repr(t[0]) for t in results]
+            keys = [t[0] for t in results]
             s = format('%L', keys)
             irc.reply(s)
     search = wrap(search, ['channel',
