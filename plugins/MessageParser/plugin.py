@@ -60,6 +60,12 @@ import supybot.world as world
 
 import supybot.log as log
 
+def adapt_binarytext(s):
+    return sqlite3.Binary(s)
+def convert_binarytext(s):
+    return str(s)
+sqlite3.register_adapter(str, adapt_binarytext)
+sqlite3.register_converter("BINARYTEXT", convert_binarytext)
 
 class MessageParser(callbacks.Plugin, plugins.ChannelDBHandler):
     """This plugin can set regexp triggers to activate the bot.
@@ -72,20 +78,20 @@ class MessageParser(callbacks.Plugin, plugins.ChannelDBHandler):
     def makeDb(self, filename):
         """Create the database and connect to it."""
         if os.path.exists(filename):
-            db = sqlite3.connect(filename)
+            db = sqlite3.connect(filename, detect_types=sqlite3.PARSE_DECLTYPES)
             db.text_factory = str
             return db
-        db = sqlite3.connect(filename)
+        db = sqlite3.connect(filename, detect_types=sqlite3.PARSE_DECLTYPES)
         db.text_factory = str
         cursor = db.cursor()
         cursor.execute("""CREATE TABLE triggers (
                           id INTEGER PRIMARY KEY,
-                          regexp TEXT UNIQUE ON CONFLICT REPLACE,
+                          regexp BINARYTEXT UNIQUE ON CONFLICT REPLACE,
                           added_by TEXT,
-                          added_at TIMESTAMP,
+                          added_at INTEGER,
                           usage_count INTEGER,
-                          action TEXT,
-                          locked BOOLEAN
+                          action BINARYTEXT,
+                          locked NUMERIC
                           )""")
         db.commit()
         return db
@@ -220,6 +226,11 @@ class MessageParser(callbacks.Plugin, plugins.ChannelDBHandler):
         for (option, arg) in optlist:
             if option == 'id':
                 target = 'id'
+                try:
+                    regexp = int(regexp)
+                except ValueError:
+                    irc.error('id must be an integer')
+                    return
         sql = "SELECT id, locked FROM triggers WHERE %s=?" % (target,)
         cursor.execute(sql, (regexp,))
         results = cursor.fetchall()
@@ -298,6 +309,11 @@ class MessageParser(callbacks.Plugin, plugins.ChannelDBHandler):
         for (option, arg) in optlist:
             if option == 'id':
                 target = 'id'
+                try:
+                    regexp = int(regexp)
+                except ValueError:
+                    irc.error('id must be an integer')
+                    return
         sql = "SELECT regexp, action FROM triggers WHERE %s=?" % (target,)
         cursor.execute(sql, (regexp,))
         results = cursor.fetchall()
@@ -326,6 +342,11 @@ class MessageParser(callbacks.Plugin, plugins.ChannelDBHandler):
         for (option, arg) in optlist:
             if option == 'id':
                 target = 'id'
+                try:
+                    regexp = int(regexp)
+                except ValueError:
+                    irc.error('id must be an integer')
+                    return
         sql = "SELECT * FROM triggers WHERE %s=?" % (target,)
         cursor.execute(sql, (regexp,))
         results = cursor.fetchall()

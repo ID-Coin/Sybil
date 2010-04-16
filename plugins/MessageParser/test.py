@@ -79,6 +79,7 @@ class MessageParserTestCase(ChannelPluginTestCase):
         self.assertRegexp('messageparser info "nostuff"', 'there is no such regexp trigger')
         self.assertRegexp('messageparser info "stuff"', '.*i saw some stuff.*')
         self.assertRegexp('messageparser info --id 1', '.*i saw some stuff.*')
+        self.assertError('messageparser info --id aoeu')
         self.assertRegexp('messageparser info "stuff"', 'has been triggered 0 times')
         self.feedMsg('this message has some stuff in it')
         self.getMsg(' ')
@@ -133,7 +134,39 @@ class MessageParserTestCase(ChannelPluginTestCase):
         self.assertNotError('messageparser remove "stuff"')
         self.assertNotError('messageparser add "stuff" "echo i saw some stuff"')
         self.assertNotError('messageparser remove --id 1')
+
+    def testNullBytesHandling(self):
+        """test some stuff with null bytes
         
+        we have to be clever here, since this doesn't behave the same as a real
+        irc message. 
+        
+        a real irc message passes in a backslash, and a zero, which later 
+        gets interpreted somewhere along the line as a \x00 char.
+        
+        here, our \0 gets interpreted as \x00 right away, and runs afoul of
+        the ircutils.isValidArgument(), which doesn't allow \x00.
+        
+        as a result, we cannot just do something like this, even though it
+        does work is a 'real irc' scenario:
+            self.assertNotError('messageparser add "foo\0bar" "echo moo\0zoob"')
+        
+        so instead, we construct the callback arguments manually and directly
+        invoke the callbacks.
+        """
+        cb = self.irc.getCallback('MessageParser')
+        msg = ircmsgs.privmsg(self.channel, '@messageparser add stuff stuff', 
+                prefix=self.prefix) # just any dummy msg
+        ircobj = callbacks.ReplyIrcProxy(self.irc, msg)
+        cb.add(ircobj, msg, [self.channel, 'bla\0moo','echo foo'])
+        m = self.getMsg(' ') # flush response from previous call
+        cb.list(ircobj, msg, [self.channel, ])
+        m = self.getMsg(' ')
+        # the below works, if we have successfully stored the null-byte
+        # containing string in the db.
+        self.failUnless(r'bla\x00moo' in str(m))
+
+
     def testVacuum(self):
         self.assertNotError('messageparser add "stuff" "echo i saw some stuff"')
         self.assertNotError('messageparser remove "stuff"')
@@ -161,7 +194,7 @@ class MessageParserTestCase(ChannelPluginTestCase):
         try:
             conf.supybot.plugins.MessageParser.keepRankInfo.setValue(False)
             self.assertNotError('messageparser add "stuff" "echo i saw some stuff"')
-            self.feedMsg('instead of asdf, dvorak has aoeu')
+            self.feedMsg('instead of asdf, dvorak has aoeu and stuff')
             self.getMsg(' ')
             self.assertRegexp('messageparser info "stuff"', 'has been triggered 0 times')
         finally:
