@@ -1,6 +1,7 @@
 # -*- encoding: utf-8 -*-
 ###
 # Copyright (c) 2003-2005, Daniel DiPaolo
+# Copyright (c) 2008, James Vega
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -29,12 +30,7 @@
 ###
 
 from supybot.test import *
-#import supybot.plugin as plugin
 import supybot.ircutils as ircutils
-try:
-    import sqlite3
-except ImportError:
-    from pysqlite2 import dbapi2 as sqlite3 # for python2.4
 
 MF = plugin.loadPluginModule('MoobotFactoids')
 MFconf = conf.supybot.plugins.MoobotFactoids
@@ -222,7 +218,7 @@ class FactoidsTestCase(ChannelPluginTestCase):
         self.assertRegexp('most authored',
                             'Most prolific authors:.*moo.*(1).*boo.*(1)')
         self.assertRegexp('most recent',
-                            "2 latest factoids:.*moogle.*mogle.*")
+                            "2 latest factoids:.*mogle.*moogle.*")
         self.assertResponse('moogle', 'moo')
         self.assertRegexp('most popular',
                             "Top 1 requested factoid:.*moogle.*(2)")

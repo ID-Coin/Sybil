@@ -1,5 +1,6 @@
 ###
 # Copyright (c) 2003-2005, Daniel DiPaolo
+# Copyright (c) 2008, James Vega
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -31,6 +32,7 @@ import os
 import time
 import shlex
 import string
+import datetime
 
 from cStringIO import StringIO
 
@@ -85,6 +87,199 @@ class OptionList(object):
 
 def pickOptions(s):
     return OptionList().tokenize(s)
+
+class SqlalchemyMoobotDB(object):
+    def __init__(self, filename, engine):
+        self.filename = filename
+        self.engine = engine
+        self.dbs = ircutils.IrcDict()
+        self.meta = ircutils.IrcDict()
+
+    def close(self):
+        self.dbs.clear()
+
+    def _getDb(self, channel):
+        if channel in self.dbs:
+            return self.dbs[channel]
+
+        try:
+            import sqlalchemy as sql
+            self.sql = sql
+        except ImportError:
+            raise callbacks.Error, \
+                    'You need to have SQLAlchemy installed to use this ' \
+                    'plugin.  Download it at <http://www.sqlalchemy.org/>'
+
+        filename = plugins.makeChannelFilename(self.filename, channel)
+        engine = sql.create_engine(self.engine + filename)
+        metadata = sql.MetaData()
+        factoids = sql.Table('factoids', metadata,
+                             sql.Column('key', sql.Text, primary_key=True,
+                                        unique=True),
+                             sql.Column('created_by', sql.Integer),
+                             sql.Column('created_at', sql.TIMESTAMP,
+                                        default=datetime.datetime.now),
+                             sql.Column('modified_by', sql.Integer),
+                             sql.Column('modified_at', sql.TIMESTAMP,
+                                        onupdate=datetime.datetime.now),
+                             sql.Column('locked_at', sql.TIMESTAMP,
+                                        onupdate=datetime.datetime.now),
+                             sql.Column('locked_by', sql.Integer),
+                             sql.Column('last_requested_by', sql.Text),
+                             sql.Column('last_requested_at', sql.TIMESTAMP,
+                                        onupdate=datetime.datetime.now),
+                             sql.Column('fact', sql.Text),
+                             sql.Column('requested_count', sql.Integer),
+                         )
+        metadata.create_all(engine)
+        self.dbs[channel] = (engine, factoids)
+        return self.dbs[channel]
+
+    def _encode(self, x):
+        if x is None:
+            return x
+        L = []
+        for elt in x:
+            if isinstance(elt, unicode):
+                L.append(elt.encode('utf-8'))
+            elif isinstance(elt, datetime.datetime):
+                L.append(int(time.mktime(elt.now().utctimetuple())))
+            else:
+                L.append(elt)
+        return L
+
+    def getFactoid(self, channel, key):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.fact], factoids.c.key.like(key))
+        result = db.execute(s)
+        r = result.fetchone()
+        result.close()
+        return self._encode(r)
+
+    def getFactinfo(self, channel, key):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.created_by, factoids.c.created_at,
+                             factoids.c.modified_by, factoids.c.modified_at,
+                             factoids.c.last_requested_by,
+                             factoids.c.last_requested_at,
+                             factoids.c.requested_count,
+                             factoids.c.locked_by, factoids.c.locked_at],
+                            factoids.c.key.like(key))
+        result = db.execute(s)
+        r = result.fetchone()
+        result.close()
+        return self._encode(r)
+
+    def randomFactoid(self, channel):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.fact, factoids.c.key]) \
+                           .order_by(self.sql.func.random()).limit(1)
+        result = db.execute(s)
+        r = result.fetchone()
+        result.close()
+        return self._encode(r)
+
+    def addFactoid(self, channel, key, value, creator_id):
+        (db, factoids) = self._getDb(channel)
+        db.execute(factoids.insert(), key=key, created_by=creator_id,
+                   fact=value, requested_count=0).close()
+
+    def updateFactoid(self, channel, key, newvalue, modifier_id):
+        (db, factoids) = self._getDb(channel)
+        db.execute(factoids.update(factoids.c.key.like(key)), fact=newvalue,
+                   modified_by=modifier_id).close()
+
+    def updateRequest(self, channel, key, hostmask):
+        (db, factoids) = self._getDb(channel)
+        u = factoids.update(factoids.c.key.like(key),
+                            values={factoids.c.requested_count:
+                                    factoids.c.requested_count + 1})
+        db.execute(u, last_requested_by=hostmask).close()
+
+    def removeFactoid(self, channel, key):
+        (db, factoids) = self._getDb(channel)
+        db.execute(factoids.delete(factoids.c.key.like(key))).close()
+
+    def locked(self, channel, key):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.locked_by], factoids.c.key.like(key))
+        result = db.execute(s)
+        r = result.fetchone()
+        result.close()
+        return r[0] is not None
+
+    def lock(self, channel, key, locker_id):
+        (db, factoids) = self._getDb(channel)
+        db.execute(factoids.update(factoids.c.key.like(key)),
+                   locked_by=locker_id).close()
+
+    def unlock(self, channel, key):
+        (db, factoids) = self._getDb(channel)
+        db.execute(factoids.update(factoids.c.key.like(key)), locked_by=None,
+                   locked_at=None).close()
+
+    def mostAuthored(self, channel, limit):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.created_by,
+                             self.sql.func.count(factoids.c.key)]) \
+                           .group_by(factoids.c.created_by) \
+                           .order_by(self.sql.func.count(factoids.c.key) \
+                                                        .desc()) \
+                           .limit(limit)
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        return [self._encode(x) for x in r]
+
+    def mostRecent(self, channel, limit):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.key]) \
+                           .order_by(factoids.c.created_at.desc()) \
+                           .limit(limit)
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        return [self._encode(x) for x in r]
+
+    def mostPopular(self, channel, limit):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.key, factoids.c.requested_count],
+                            factoids.c.requested_count > 0) \
+                           .order_by(factoids.c.requested_count.desc()) \
+                           .limit(limit)
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        return [self._encode(x) for x in r]
+
+    def getKeysByAuthor(self, channel, authorId):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.key], factoids.c.created_by==authorId)\
+                           .order_by(factoids.c.key)
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        return [self._encode(x) for x in r]
+
+    def getKeysByGlob(self, channel, glob):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.key],
+                            factoids.c.key.like('%%%s%%' % glob)) \
+                           .order_by(factoids.c.key)
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        return [self._encode(x) for x in r]
+
+    def getKeysByValueGlob(self, channel, glob):
+        (db, factoids) = self._getDb(channel)
+        s = self.sql.select([factoids.c.key],
+                            factoids.c.key.like('%%%s%%' % glob)) \
+                           .order_by(factoids.c.key)
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        return [self._encode(x) for x in r]
 
 class SqliteMoobotDB(object):
     def __init__(self, filename):
@@ -281,7 +476,8 @@ class SqliteMoobotDB(object):
         results = cursor.fetchall()
         return results
 
-MoobotDB = plugins.DB('MoobotFactoids', {'sqlite3': SqliteMoobotDB})
+MoobotDB = plugins.DB('MoobotFactoids', {'sqlite3': SqliteMoobotDB,
+                                         'sqlalchemy': SqlalchemyMoobotDB})
 
 class MoobotFactoids(callbacks.Plugin):
     """Add the help for "@help MoobotFactoids" here (assuming you don't implement a MoobotFactoids
@@ -494,7 +690,7 @@ class MoobotFactoids(callbacks.Plugin):
             s += format(' Last requested by %s on %s, requested %n.',
                         last_by, last_at, (requested_count, 'time'))
         # Last, locked info
-        if locked_at is not None:
+        if locked_by is not None:
             lock_at = time.strftime(conf.supybot.reply.format.time(),
                                      time.localtime(int(locked_at)))
             lock_by = plugins.getUserName(locked_by)
