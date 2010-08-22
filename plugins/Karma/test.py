@@ -1,5 +1,6 @@
 ###
 # Copyright (c) 2005, Jeremiah Fincher
+# Copyright (c) 2008, James Vega
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -28,11 +29,6 @@
 ###
 
 from supybot.test import *
-
-try:
-    import sqlite3
-except ImportError:
-    from pysqlite2 import dbapi2 as sqlite3 # for python2.4
 
 class KarmaTestCase(ChannelPluginTestCase):
     plugins = ('Karma',)
@@ -178,7 +174,7 @@ class KarmaTestCase(ChannelPluginTestCase):
         self.assertNoResponse('foo++', 1)
         self.assertRegexp('karma foo', '1')
         self.assertNotError('karma clear foo')
-        self.assertRegexp('karma foo', '0')
+        self.assertRegexp('karma foo', 'neutral karma')
         self.assertNotRegexp('karma foo', '1')
 
 #        def testNoKarmaDunno(self):

@@ -31,6 +31,7 @@
 import os
 import csv
 
+import supybot.dbi as dbi
 import supybot.conf as conf
 import supybot.utils as utils
 from supybot.commands import *
@@ -39,10 +40,202 @@ import supybot.ircmsgs as ircmsgs
 import supybot.ircutils as ircutils
 import supybot.callbacks as callbacks
 
-try:
-    import sqlite3
-except ImportError:
-    from pysqlite2 import dbapi2 as sqlite3 # for python2.4
+class SqlalchemyKarmaDB(object):
+    def __init__(self, filename, engine):
+        self.filename = filename
+        self.engine = engine
+        self.dbs = ircutils.IrcDict()
+        self.meta = ircutils.IrcDict()
+
+    def close(self):
+        self.dbs.clear()
+
+    def _getDb(self, channel, debug=False):
+        if channel in self.dbs:
+            return self.dbs[channel]
+
+        try:
+            import sqlalchemy as sql
+            self.sql = sql
+        except ImportError:
+            raise callbacks.Error, \
+                    'You need to have SQLAlchemy installed to use this ' \
+                    'plugin.  Download it at <http://www.sqlalchemy.org/>'
+
+        filename = plugins.makeChannelFilename(self.filename, channel)
+        engine = sql.create_engine(self.engine + filename, echo=debug)
+        metadata = sql.MetaData()
+        karma = sql.Table('karma', metadata,
+                          sql.Column('id', sql.Integer, primary_key=True),
+                          sql.Column('name', sql.Text),
+                          sql.Column('normalized', sql.Text, unique=True),
+                          sql.Column('added', sql.Integer, default=0),
+                          sql.Column('subtracted', sql.Integer, default=0),
+                         )
+        metadata.create_all(engine)
+        self.dbs[channel] = (engine, karma)
+        return self.dbs[channel]
+
+    def get(self, channel, thing):
+        (db, karma) = self._getDb(channel)
+        thing = thing.lower()
+        s = self.sql.select([karma.c.added, karma.c.subtracted],
+                            karma.c.normalized==thing)
+        result = db.execute(s)
+        r = result.fetchone()
+        result.close()
+        if r:
+            return [int(x) for x in r]
+        else:
+            raise dbi.NoRecordError
+
+    def gets(self, channel, things):
+        (db, karma) = self._getDb(channel)
+        normalizedThings = dict(zip(map(lambda s: s.lower(), things), things))
+        L = normalizedThings.keys()
+        ors = None
+        for (i, v) in enumerate(L):
+            if ors:
+                ors = self.sql.or_(ors, karma.c.normalized==L[i])
+            else:
+                ors = self.sql.or_(karma.c.normalized==L[i])
+        s = self.sql.select([karma.c.name, karma.c.added-karma.c.subtracted],
+                            ors) \
+                           .order_by((karma.c.added-karma.c.subtracted).desc())
+        result = db.execute(s)
+        r = result.fetchall()
+        result.close()
+        L = [(name, int(karma)) for (name, karma) in r]
+        for (name, _) in L:
+            del normalizedThings[name.lower()]
+        neutrals = normalizedThings.values()
+        neutrals.sort()
+        return (L, neutrals)
+
+    def top(self, channel, limit):
+        (db, karma) = self._getDb(channel)
+        s = self.sql.select([karma.c.name, karma.c.added-karma.c.subtracted]) \
+                           .order_by((karma.c.added-karma.c.subtracted).desc()) \
+                           .limit(limit)
+        result = db.execute(s)
+        r = result.fetchall()
+        result.close()
+        return [(t[0], int(t[1])) for t in r]
+
+    def bottom(self, channel, limit):
+        (db, karma) = self._getDb(channel)
+        s = self.sql.select([karma.c.name, karma.c.added-karma.c.subtracted]) \
+                           .order_by((karma.c.added-karma.c.subtracted).asc()) \
+                           .limit(limit)
+        result = db.execute(s)
+        r = result.fetchall()
+        result.close()
+        return [(t[0], int(t[1])) for t in r]
+
+    def rank(self, channel, thing):
+        (db, karma) = self._getDb(channel)
+        s = self.sql.select([karma.c.added-karma.c.subtracted],
+                            karma.c.name==thing)
+        result = db.execute(s)
+        r = result.fetchone()
+        result.close()
+        if not r:
+            raise dbi.NoRecordError
+        karma = int(r[0])
+        s = self.sql.select([self.sql.func.count()],
+                            karma.c.added-karma.c.subtracted > karma)
+        result = db.execute(s)
+        r = result.fetchone()
+        result.close()
+        rank = int(r[0])
+        return rank+1
+
+    def size(self, channel):
+        (db, karma) = self._getDb(channel)
+        s = self.sql.select([self.sql.func.count()])
+        results = db.execute(s)
+        r = results.fetchone()
+        results.close()
+        return int(r[0])
+
+    def increment(self, channel, name):
+        (db, karma) = self._getDb(channel)
+        normalized = name.lower()
+        s = self.sql.select([karma.c.normalized],
+                            karma.c.normalized==normalized)
+        results = db.execute(s)
+        r = results.fetchone()
+        results.close()
+        if not r:
+            db.execute(karma.insert(), name=name, normalized=normalized).close()
+        db.execute(karma.update(karma.c.normalized==normalized,
+                                values={karma.c.added: karma.c.added+1}))
+
+    def decrement(self, channel, name):
+        (db, karma) = self._getDb(channel)
+        normalized = name.lower()
+        s = self.sql.select([karma.c.normalized],
+                            karma.c.normalized==normalized)
+        results = db.execute(s)
+        r = results.fetchone()
+        results.close()
+        if not r:
+            db.execute(karma.insert(), name=name, normalized=normalized).close()
+        db.execute(karma.update(karma.c.normalized==normalized,
+                                values={karma.c.subtracted:
+                                        karma.c.subtracted+1}))
+
+    def most(self, channel, kind, limit):
+        (db, karma) = self._getDb(channel)
+        if kind == 'increased':
+            s = self.sql.select([karma.c.name, karma.c.added]) \
+                               .order_by(karma.c.added.desc()).limit(limit)
+        elif kind == 'decreased':
+            s = self.sql.select([karma.c.name, karma.c.subtracted]) \
+                               .order_by(karma.c.subtracted.desc()) \
+                               .limit(limit)
+        elif kind == 'active':
+            s = self.sql.select([karma.c.name,
+                                 karma.c.added+karma.c.subtracted]) \
+                               .order_by((karma.c.added+karma.c.subtracted) \
+                                         .desc()) \
+                               .limit(limit)
+        else:
+            raise ValueError, 'invalid kind'
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        return [(name, int(i)) for (name, i) in r]
+
+    def clear(self, channel, name):
+        (db, karma) = self._getDb(channel)
+        normalized = name.lower()
+        db.execute(karma.delete(karma.c.normalized==normalized)).close()
+
+    def dump(self, channel, filename):
+        filename = conf.supybot.directories.data.dirize(filename)
+        fd = utils.transactionalFile(filename)
+        out = csv.writer(fd)
+        (db, karma) = self._getDb(channel)
+        s = self.sql.select([karma.c.name, karma.c.added, karma.c.subtracted])
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        for (name, added, subtracted) in r:
+            out.writerow([name, added, subtracted])
+        fd.close()
+
+    def load(self, channel, filename):
+        filename = conf.supybot.directories.data.dirize(filename)
+        fd = file(filename)
+        reader = csv.reader(fd)
+        (db, karma) = self._getDb(channel)
+        db.execute(karma.delete()).close()
+        for (name, added, subtracted) in reader:
+            normalized = name.lower()
+            db.execute(karma.insert(), name=name, normalized=normalized,
+                       added=added, subtracted=subtracted).close()
+        fd.close()
 
 class SqliteKarmaDB(object):
     def __init__(self, filename):
@@ -55,15 +248,27 @@ class SqliteKarmaDB(object):
 
     def _getDb(self, channel):
         filename = plugins.makeChannelFilename(self.filename, channel)
+        def p(s1, s2):
+            return int(ircutils.nickEqual(s1.encode('iso8859-1'),
+                                          s2.encode('iso8859-1')))
         if filename in self.dbs:
+            self.dbs[filename].create_function('nickeq', 2, p)
             return self.dbs[filename]
+            
+        try:
+            import sqlite3
+        except ImportError:
+            from pysqlite2 import dbapi2 as sqlite3 # for python2.4
+            
         if os.path.exists(filename):
             db = sqlite3.connect(filename)
             db.text_factory = str
+            db.create_function('nickeq', 2, p)
             self.dbs[filename] = db
             return db
         db = sqlite3.connect(filename)
         db.text_factory = str
+        db.create_function('nickeq', 2, p)
         self.dbs[filename] = db
         cursor = db.cursor()
         cursor.execute("""CREATE TABLE karma (
@@ -74,9 +279,6 @@ class SqliteKarmaDB(object):
                           subtracted INTEGER
                           )""")
         db.commit()
-        def p(s1, s2):
-            return int(ircutils.nickEqual(s1, s2))
-        db.create_function('nickeq', 2, p)
         return db
 
     def get(self, channel, thing):
@@ -85,11 +287,11 @@ class SqliteKarmaDB(object):
         cursor = db.cursor()
         cursor.execute("""SELECT added, subtracted FROM karma
                           WHERE normalized=?""", (thing,))
-        results = cursor.fetchall()
-        if len(results) == 0:
-            return None
+        result = cursor.fetchone()
+        if result:
+            return map(int, result)
         else:
-            return map(int, results[0])
+            raise dbi.NoRecordError
 
     def gets(self, channel, things):
         db = self._getDb(channel)
@@ -98,7 +300,7 @@ class SqliteKarmaDB(object):
         criteria = ' OR '.join(['normalized=?'] * len(normalizedThings))
         sql = """SELECT name, added-subtracted FROM karma
                  WHERE %s ORDER BY added-subtracted DESC""" % criteria
-        cursor.execute(sql, normalizedThings.keys())
+        cursor.execute(sql, tuple(normalizedThings.keys()))
         L = [(name, int(karma)) for (name, karma) in cursor.fetchall()]
         for (name, _) in L:
             del normalizedThings[name.lower()]
@@ -125,10 +327,10 @@ class SqliteKarmaDB(object):
         cursor = db.cursor()
         cursor.execute("""SELECT added-subtracted FROM karma
                           WHERE name=?""", (thing,))
-        results = cursor.fetchall()
-        if len(results) == 0:
-            return None
-        karma = int(results[0][0])
+        result = cursor.fetchone()
+        if not result:
+            raise dbi.NoRecordError
+        karma = int(result[0])
         cursor.execute("""SELECT COUNT(*) FROM karma
                           WHERE added-subtracted > ?""", (karma,))
         rank = int(cursor.fetchone()[0])
@@ -180,8 +382,7 @@ class SqliteKarmaDB(object):
         db = self._getDb(channel)
         cursor = db.cursor()
         normalized = name.lower()
-        cursor.execute("""UPDATE karma SET subtracted=0, added=0
-                          WHERE normalized=?""", (normalized,))
+        cursor.execute("""DELETE FROM karma WHERE normalized=?""", (normalized,))
         db.commit()
 
     def dump(self, channel, filename):
@@ -211,7 +412,8 @@ class SqliteKarmaDB(object):
         fd.close()
 
 KarmaDB = plugins.DB('Karma',
-                     {'sqlite3': SqliteKarmaDB})
+                     {'sqlite3': SqliteKarmaDB,
+                      'sqlalchemy': SqlalchemyKarmaDB})
 
 class Karma(callbacks.Plugin):
     callBefore = ('Factoids', 'MoobotFactoids', 'Infobot')
@@ -288,20 +490,21 @@ class Karma(callbacks.Plugin):
         """
         if len(things) == 1:
             name = things[0]
-            t = self.db.get(channel, name)
-            if t is None:
+            try:
+                t = self.db.get(channel, name)
+            except dbi.NoRecordError:
                 irc.reply(format('%s has neutral karma.', name))
+                return
+            (added, subtracted) = t
+            total = added - subtracted
+            if self.registryValue('simpleOutput', channel):
+                s = format('%s: %i', name, total)
             else:
-                (added, subtracted) = t
-                total = added - subtracted
-                if self.registryValue('simpleOutput', channel):
-                    s = format('%s: %i', name, total)
-                else:
-                    s = format('Karma for %q has been increased %n and '
-                               'decreased %n for a total karma of %s.',
-                               name, (added, 'time'), (subtracted, 'time'),
-                               total)
-                irc.reply(s)
+                s = format('Karma for %q has been increased %n and '
+                           'decreased %n for a total karma of %s.',
+                           name, (added, 'time'), (subtracted, 'time'),
+                           total)
+            irc.reply(s)
         elif len(things) > 1:
             (L, neutrals) = self.db.gets(channel, things)
             if L:
@@ -323,12 +526,12 @@ class Karma(callbacks.Plugin):
             if not (highest and lowest):
                 irc.error('I have no karma for this channel.')
                 return
-            rank = self.db.rank(channel, msg.nick)
-            if rank is not None:
+            try:
+                rank = self.db.rank(channel, msg.nick)
                 total = self.db.size(channel)
                 rankS = format('  You (%s) are ranked %i out of %i.',
                                msg.nick, rank, total)
-            else:
+            except dbi.NoRecordError:
                 rankS = ''
             s = format('Highest karma: %L.  Lowest karma: %L.%s',
                        highest, lowest, rankS)
@@ -361,6 +564,26 @@ class Karma(callbacks.Plugin):
         self.db.clear(channel, name)
         irc.replySuccess()
     clear = wrap(clear, [('checkChannelCapability', 'op'), 'text'])
+
+    def getName(self, nick, msg, match):
+        addressed = callbacks.addressed(nick, msg)
+        name = callbacks.addressed(nick,
+                   ircmsgs.IrcMsg(prefix='',
+                                  args=(msg.args[0], match.group(1)),
+                                  msg=msg))
+        if not name:
+            name = match.group(1)
+        if not addressed:
+            if not self.registryValue('allowUnaddressedKarma'):
+                return ''
+            if not msg.args[1].startswith(match.group(1)):
+                return ''
+            name = match.group(1)
+        elif addressed:
+            if not addressed.startswith(name):
+                return ''
+        name = name.strip('()')
+        return name
 
     def dump(self, irc, msg, args, channel, filename):
         """[<channel>] <filename>
