@@ -124,10 +124,21 @@ def DB(filename, types):
             if type == 'sqlalchemy':
                 sa = conf.supybot.databases.sqlalchemy
                 engine = sa.engine()
+                if engine == 'sqlite':
+                    # need this to avoid automatic unicode conversion in sqlite
+                    from sqlalchemy.interfaces import PoolListener
+                    class SetTextFactory(PoolListener):
+                         def connect(self, dbapi_con, con_record):
+                             dbapi_con.text_factory = str
+                    listeners=[SetTextFactory(),]
+                else:
+                    # TODO: not sure whether other engines need the same...
+                    # probably needs testing to make sure. for now, assume no.
+                    listeners = []
                 s = sa.engine.connection()
                 fn = '.'.join([filename, type, engine, 'db'])
                 try:
-                    return types[type](fn, s, *args, **kwargs)
+                    return types[type](fn, s, listeners, *args, **kwargs)
                 except KeyError:
                     continue
             else:
