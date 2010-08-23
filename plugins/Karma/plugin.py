@@ -41,9 +41,10 @@ import supybot.ircutils as ircutils
 import supybot.callbacks as callbacks
 
 class SqlalchemyKarmaDB(object):
-    def __init__(self, filename, engine):
+    def __init__(self, filename, connection, listeners):
         self.filename = filename
-        self.engine = engine
+        self.connection = connection
+        self.listeners = listeners
         self.dbs = ircutils.IrcDict()
         self.meta = ircutils.IrcDict()
 
@@ -63,7 +64,8 @@ class SqlalchemyKarmaDB(object):
                     'plugin.  Download it at <http://www.sqlalchemy.org/>'
 
         filename = plugins.makeChannelFilename(self.filename, channel)
-        engine = sql.create_engine(self.engine + filename, echo=debug)
+        engine = sql.create_engine(self.connection + filename, 
+                                    listeners = self.listeners)
         metadata = sql.MetaData()
         karma = sql.Table('karma', metadata,
                           sql.Column('id', sql.Integer, primary_key=True),
