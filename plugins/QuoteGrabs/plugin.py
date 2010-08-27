@@ -41,15 +41,6 @@ import supybot.plugins as plugins
 import supybot.ircutils as ircutils
 import supybot.callbacks as callbacks
 
-try:
-    import sqlite3
-except ImportError:
-    from pysqlite2 import dbapi2 as sqlite3 # for python2.4
-
-import traceback
-
-#sqlite3.register_converter('bool', bool)
-
 class QuoteGrabsRecord(dbi.Record):
     __fields__ = [
         'by',
@@ -64,6 +55,180 @@ class QuoteGrabsRecord(dbi.Record):
         return format('%s (Said by: %s; grabbed by %s at %t)',
                       self.text, self.hostmask, grabber, self.at)
 
+class SqlAlchemyQuoteGrabsDB(object):
+    def __init__(self, filename, connection, listeners):
+        self.filename = filename
+        self.connection = connection
+        self.listeners = listeners
+        self.dbs = ircutils.IrcDict()
+        self.meta = ircutils.IrcDict()
+
+    def close(self):
+        self.dbs.clear()
+
+    def _getDb(self, channel):
+        import datetime
+        try:
+            import sqlalchemy as sql
+            self.sql = sql
+        except ImportError:
+            raise callbacks.Error, \
+                    'You need to have SQLAlchemy installed to use this ' \
+                    'plugin.  Download it at <http://www.sqlalchemy.org/>'
+
+        if channel in self.dbs:
+            return self.dbs[channel]
+
+        class Timestamp(sql.types.TypeDecorator):
+            """type that decorates TIMESTAMP to give back seconds since epoch
+            value instead of datetime object"""
+            impl = sql.TIMESTAMP
+            def process_result_value(self, value, dialect):
+                if value is not None:
+                    value = time.mktime(value.utctimetuple())
+                return value
+
+        filename = plugins.makeChannelFilename(self.filename, channel)
+        engine = sql.create_engine(self.connection + filename,
+                                   listeners=self.listeners)
+        metadata = sql.MetaData()
+        quotegrabs = sql.Table('quotegrabs', metadata,
+                               sql.Column('id', sql.Integer,
+                                          primary_key=True, unique=True),
+                               sql.Column('nick', sql.Text),
+                               sql.Column('hostmask', sql.Text),
+                               sql.Column('added_by', sql.Text),
+                               sql.Column('added_at', Timestamp,
+                                          default=datetime.datetime.now),
+                               sql.Column('quote', sql.Text),
+                              )
+        metadata.create_all(engine)
+        self.dbs[channel] = (engine, quotegrabs)
+        return self.dbs[channel]
+
+    def get(self, channel, id):
+        (db, quotegrabs) = self._getDb(channel)
+        s = self.sql.select([quotegrabs], quotegrabs.c.id==id)
+        result = db.execute(s)
+        quote = result.fetchone()
+        result.close()
+        if result is None:
+            raise dbi.NoRecordError
+        return QuoteGrabsRecord(quote['id'], by=quote['nick'],
+                                text=quote['quote'],
+                                hostmask=quote['hostmask'],
+                                at=quote['added_at'],
+                                grabber=quote['added_by'])
+
+    def random(self, channel, nick):
+        (db, quotegrabs) = self._getDb(channel)
+        if nick:
+            s = self.sql.select([quotegrabs.c.quote],
+                                quotegrabs.c.nick.like(nick)) \
+                               .order_by(self.sql.func.random()).limit(1)
+        else:
+            s = self.sql.select([quotegrabs.c.quote]) \
+                          .order_by(self.sql.func.random()) \
+                          .limit(1)
+        results = db.execute(s)
+        quote = results.fetchone()
+        results.close()
+        if quote is None:
+            raise dbi.NoRecordError
+        return quote[0]
+
+    def list(self, channel, nick):
+        (db, quotegrabs) = self._getDb(channel)
+        s = self.sql.select([quotegrabs.c.id, quotegrabs.c.quote],
+                            quotegrabs.c.nick.like(nick)) \
+                           .order_by(quotegrabs.c.id.desc())
+        results = db.execute(s)
+        quotes = results.fetchall()
+        results.close()
+        if not quotes:
+            raise dbi.NoRecordError
+        return [QuoteGrabsRecord(id, text=quote)
+                for (id, quote) in quotes]
+
+    def getQuote(self, channel, nick):
+        (db, quotegrabs) = self._getDb(channel)
+        s = self.sql.select([quotegrabs.c.quote],
+                            quotegrabs.c.nick.like(nick)) \
+                           .order_by(quotegrabs.c.id.desc()).limit(1)
+        results = db.execute(s)
+        quote = results.fetchone()
+        results.close()
+        if quote is None:
+            raise dbi.NoRecordError
+        return quote[0]
+
+    def select(self, channel, nick):
+        (db, quotegrabs) = self._getDb(channel)
+        s = self.sql.select([quotegrabs.c.added_at],
+                            quotegrabs.c.nick.like(nick)) \
+                           .order_by(quotegrabs.c.id.desc()).limit(1)
+        results = db.execute(s)
+        r = results.fetchone()
+        results.close()
+        if r is None:
+            raise dbi.NoRecordError
+        return r[0]
+
+    def add(self, channel, msg, by):
+        (db, quotegrabs) = self._getDb(channel)
+        text = ircmsgs.prettyPrint(msg)
+        # Check to see if the latest quotegrab is identical
+        s = self.sql.select([quotegrabs.c.quote],
+                            quotegrabs.c.nick.like(msg.nick)) \
+                           .order_by(quotegrabs.c.id.desc()).limit(1)
+        results = db.execute(s)
+        r = results.fetchone()
+        if r is not None and text == r[0]:
+            results.close()
+            return
+        db.execute(quotegrabs.insert(), nick=msg.nick, hostmask=msg.prefix,
+                   added_by=by, quote=text).close()
+
+    def remove(self, channel, grab=None):
+        (db, quotegrabs) = self._getDb(channel)
+        if grab is not None:
+            # the testing if there actually *is* the to-be-deleted record is
+            # strictly unnecessary -- the DELETE operation would "succeed"
+            # anyway, but it's silly to just keep saying 'OK' no matter what,
+            # so...
+            s = self.sql.select([quotegrabs.c.quote],
+                                quotegrabs.c.id == grab)
+            results = db.execute(s)
+            r = results.fetchone()
+            if r is None:
+                raise dbi.NoRecordError
+            db.execute(quotegrabs.delete(), id = grab).close()
+        else:
+            maxs = self.sql.select([self.sql.func.max(quotegrabs.c.id) \
+                                    .label('maxid')]).alias('maxs')
+            s = self.sql.select([quotegrabs.c.id],
+                                quotegrabs.c.id == maxs.c.maxid)
+            results = db.execute(s)
+            r = results.fetchone()
+            if r is None:
+                raise dbi.NoRecordError
+            db.execute(quotegrabs.delete(), id = r[0]).close()
+
+    def search(self, channel, text):
+        (db, quotegrabs) = self._getDb(channel)
+        s = self.sql.select([quotegrabs.c.id, quotegrabs.c.nick,
+                             quotegrabs.c.quote],
+                            quotegrabs.c.quote.like('%%%s%%' % text)) \
+                           .order_by(quotegrabs.c.id.desc())
+        results = db.execute(s)
+        r = results.fetchall()
+        results.close()
+        if not r:
+            raise dbi.NoRecordError
+        quotes = [QuoteGrabsRecord(id, text=quote, by=nick)
+                  for (id, nick, quote) in r]
+        return quotes
+
 class SqliteQuoteGrabsDB(object):
     def __init__(self, filename):
         self.dbs = ircutils.IrcDict()
@@ -75,11 +240,17 @@ class SqliteQuoteGrabsDB(object):
 
     def _getDb(self, channel):
         filename = plugins.makeChannelFilename(self.filename, channel)
+        try:
+            import sqlite3
+        except ImportError:
+            from pysqlite2 import dbapi2 as sqlite3 # for python2.4
         def p(s1, s2):
             # text_factory seems to only apply as an output adapter,
             # so doesn't apply to created functions; so we use str()
-            return ircutils.nickEqual(str(s1), str(s2))
+            return int(ircutils.nickEqual(s1.encode('iso8859-1'),
+                                          s2.encode('iso8859-1')))
         if filename in self.dbs:
+            self.dbs[filename].create_function('nickeq', 2, p)
             return self.dbs[filename]
         if os.path.exists(filename):
             db = sqlite3.connect(filename)
@@ -108,12 +279,13 @@ class SqliteQuoteGrabsDB(object):
         cursor = db.cursor()
         cursor.execute("""SELECT id, nick, quote, hostmask, added_at, added_by
                           FROM quotegrabs WHERE id = ?""", (id,))
-        results = cursor.fetchall()
-        if len(results) == 0:
+        result = cursor.fetchone()
+        if result:
+            (id, by, quote, hostmask, at, grabber) = result
+            return QuoteGrabsRecord(id, by=by, text=quote, hostmask=hostmask,
+                                    at=int(at), grabber=grabber)
+        else:
             raise dbi.NoRecordError
-        (id, by, quote, hostmask, at, grabber) = results[0]
-        return QuoteGrabsRecord(id, by=by, text=quote, hostmask=hostmask,
-                                at=int(at), grabber=grabber)
 
     def random(self, channel, nick):
         db = self._getDb(channel)
@@ -126,10 +298,12 @@ class SqliteQuoteGrabsDB(object):
         else:
             cursor.execute("""SELECT quote FROM quotegrabs
                               ORDER BY random() LIMIT 1""")
-        results = cursor.fetchall()
-        if len(results) == 0:
+        result = cursor.fetchone()
+        if result:
+            return result[0]
+        else:
             raise dbi.NoRecordError
-        return results[0][0]
+
 
     def list(self, channel, nick):
         db = self._getDb(channel)
@@ -149,10 +323,11 @@ class SqliteQuoteGrabsDB(object):
         cursor.execute("""SELECT quote FROM quotegrabs
                           WHERE nickeq(nick, ?)
                           ORDER BY id DESC LIMIT 1""", (nick,))
-        results = cursor.fetchall()
-        if len(results) == 0:
+        quote = cursor.fetchone()
+        if quote:
+            return quote[0]
+        else:
             raise dbi.NoRecordError
-        return results[0][0]
 
     def select(self, channel, nick):
         db = self._getDb(channel)
@@ -160,10 +335,11 @@ class SqliteQuoteGrabsDB(object):
         cursor.execute("""SELECT added_at FROM quotegrabs
                           WHERE nickeq(nick, ?)
                           ORDER BY id DESC LIMIT 1""", (nick,))
-        results = cursor.fetchall()
-        if len(results) == 0:
+        addedTime = cursor.fetchone()
+        if addedTime:
+            return addedTime[0]
+        else:
             raise dbi.NoRecordError
-        return results[0][0]
 
     def add(self, channel, msg, by):
         db = self._getDb(channel)
@@ -173,10 +349,9 @@ class SqliteQuoteGrabsDB(object):
         cursor.execute("""SELECT quote FROM quotegrabs
                           WHERE nick=?
                           ORDER BY id DESC LIMIT 1""", (msg.nick,))
-        results = cursor.fetchall()
-        if len(results) != 0:
-            if text == results[0][0]:
-                return
+        quote = cursor.fetchone()
+        if quote and text == quote[0]:
+            return
         cursor.execute("""INSERT INTO quotegrabs
                           VALUES (NULL, ?, ?, ?, ?, ?)""",
                        (msg.nick, msg.prefix, by, int(time.time()), text,))
@@ -218,7 +393,8 @@ class SqliteQuoteGrabsDB(object):
         return [QuoteGrabsRecord(id, text=quote, by=nick)
                 for (id, nick, quote) in results]
 
-QuoteGrabsDB = plugins.DB('QuoteGrabs', {'sqlite3': SqliteQuoteGrabsDB})
+QuoteGrabsDB = plugins.DB('QuoteGrabs', {'sqlite3': SqliteQuoteGrabsDB,
+                                         'sqlalchemy': SqlAlchemyQuoteGrabsDB})
 
 class QuoteGrabs(callbacks.Plugin):
     """Add the help for "@help QuoteGrabs" here."""
